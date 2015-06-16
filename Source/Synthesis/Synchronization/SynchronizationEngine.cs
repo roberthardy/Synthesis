@@ -1,11 +1,11 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Diagnostics.CodeAnalysis;
 using System.Linq;
-using Sitecore.Data.Items;
 using Synthesis.Configuration;
+using Synthesis.Generation.Model;
 using Synthesis.Templates;
 using Synthesis.Utility;
-using System.Diagnostics.CodeAnalysis;
 
 namespace Synthesis.Synchronization
 {
@@ -15,36 +15,38 @@ namespace Synthesis.Synchronization
 	public class SynchronizationEngine
 	{
 		Dictionary<string, ModelTemplateReference> _typeLookup;
-		Dictionary<string, TemplateItem> _templateLookup;
+		Dictionary<string, ITemplateInfo> _templateLookup;
 
 		readonly ITemplateSignatureProvider _signatureProvider;
-		readonly ITemplateInputProvider _templateProvider;
+		readonly TemplateGenerationMetadata _templateMetadata;
 		readonly ITypeListProvider _typeListProvider;
+		private readonly string _configurationName;
 
-		public SynchronizationEngine(ITemplateSignatureProvider signatureProvider, ITemplateInputProvider templateProvider, ITypeListProvider typeListProvider)
+		public SynchronizationEngine(ITemplateSignatureProvider signatureProvider, TemplateGenerationMetadata templateMetadata, ITypeListProvider typeListProvider, string configurationName)
 		{
 			_signatureProvider = signatureProvider;
-			_templateProvider = templateProvider;
+			_templateMetadata = templateMetadata;
 			_typeListProvider = typeListProvider;
+			_configurationName = configurationName;
 		}
 
 		/// <summary>
 		/// Checks if a given Sitecore template has a corresponding interface. This method does NOT check any base templates this template may have for synchronization.
 		/// </summary>
-		public TemplateComparisonResult IsTemplateSynchronized(TemplateItem template)
+		public TemplateComparisonResult IsTemplateSynchronized(ITemplateInfo template)
 		{
 			var signature = _signatureProvider.GenerateTemplateSignature(template);
 			ModelTemplateReference reference;
 
-			if(ModelDictionary.TryGetValue(template.ID.ToString(), out reference)) 
+			if (ModelDictionary.TryGetValue(template.TemplateId.ToString(), out reference))
 				return new TemplateComparisonResult(
-					template.ID.ToString(), 
-					GetTemplateName(template), 
-					GetModelName(reference), 
-					signature, 
+					template.TemplateId.ToString(),
+					GetTemplateName(template),
+					GetModelName(reference),
+					signature,
 					reference.Metadata.VersionSignature);
 
-			return new TemplateComparisonResult(template.ID.ToString(), GetTemplateName(template), null, signature, null);
+			return new TemplateComparisonResult(template.TemplateId.ToString(), GetTemplateName(template), null, signature, null);
 		}
 
 		/// <summary>
@@ -57,16 +59,16 @@ namespace Synthesis.Synchronization
 
 		protected TemplateComparisonResult IsTemplateSynchronized(ModelTemplateReference reference)
 		{
-			TemplateItem template;
-			if (TemplateDictionary.TryGetValue(reference.Metadata.TemplateID, out template)) 
+			ITemplateInfo template;
+			if (TemplateDictionary.TryGetValue(reference.Metadata.TemplateId, out template))
 				return new TemplateComparisonResult(
-					template.ID.ToString(), 
-					GetTemplateName(template), 
-					GetModelName(reference), 
-					_signatureProvider.GenerateTemplateSignature(template), 
+					template.TemplateId.ToString(),
+					GetTemplateName(template),
+					GetModelName(reference),
+					_signatureProvider.GenerateTemplateSignature(template),
 					reference.Metadata.VersionSignature);
 
-			return new TemplateComparisonResult(reference.Metadata.TemplateID, null, GetModelName(reference), null, reference.Metadata.VersionSignature);
+			return new TemplateComparisonResult(reference.Metadata.TemplateId, null, GetModelName(reference), null, reference.Metadata.VersionSignature);
 		}
 
 		/// <summary>
@@ -87,7 +89,7 @@ namespace Synthesis.Synchronization
 
 			foreach (var modelType in ModelDictionary)
 			{
-				if (!usedTemplates.Contains(modelType.Value.Metadata.TemplateID))
+				if (!usedTemplates.Contains(modelType.Value.Metadata.TemplateId))
 				{
 					result = IsTemplateSynchronized(modelType.Value);
 					results.Add(result);
@@ -97,10 +99,10 @@ namespace Synthesis.Synchronization
 			return new TemplateComparisonResultCollection(results);
 		}
 
-		[SuppressMessage("Microsoft.Design", "CA1011:ConsiderPassingBaseTypesAsParameters", Justification="Doesn't make semantic sense")]
-		protected static string GetTemplateName(TemplateItem template)
+		[SuppressMessage("Microsoft.Design", "CA1011:ConsiderPassingBaseTypesAsParameters", Justification = "Doesn't make semantic sense")]
+		protected static string GetTemplateName(ITemplateInfo template)
 		{
-			return template.InnerItem.Paths.FullPath.Substring("/sitecore/templates".Length);
+			return template.FullPath.Substring("/sitecore/templates".Length);
 		}
 
 		protected static string GetModelName(ModelTemplateReference reference)
@@ -120,8 +122,11 @@ namespace Synthesis.Synchronization
 
 					foreach (var type in types)
 					{
-						if (_typeLookup.ContainsKey(type.Value.TemplateID)) throw new InvalidOperationException("The template " + type.Value.TemplateID + " has at least two representative classes " + _typeLookup[type.Value.TemplateID].InterfaceType.AssemblyQualifiedName + " and " + type.Key.AssemblyQualifiedName + ". This may indicate duplicate or corrupt models.");
-						_typeLookup.Add(type.Value.TemplateID, new ModelTemplateReference(type.Key, type.Value));
+						if (_typeLookup.ContainsKey(type.Value.TemplateId)) throw new InvalidOperationException("The template " + type.Value.TemplateId + " has at least two representative classes " + _typeLookup[type.Value.TemplateId].InterfaceType.AssemblyQualifiedName + " and " + type.Key.AssemblyQualifiedName + ". This may indicate duplicate or corrupt models.");
+
+						// ignore templates in other configurations
+						if (type.Value.ConfigurationName.Equals(_configurationName))
+							_typeLookup.Add(type.Value.TemplateId, new ModelTemplateReference(type.Key, type.Value));
 					}
 				}
 
@@ -129,26 +134,16 @@ namespace Synthesis.Synchronization
 			}
 		}
 
-		protected Dictionary<string, TemplateItem> TemplateDictionary
+		protected Dictionary<string, ITemplateInfo> TemplateDictionary
 		{
 			get
 			{
 				if (_templateLookup == null)
 				{
-					var templates = _templateProvider.CreateTemplateList().ToArray();
-					_templateLookup = templates.ToDictionary(x => x.ID.ToString());
-
-					// add any dependent templates of the main template list
-					foreach (var template in templates)
-					{
-						IEnumerable<TemplateInfo> baseTemplates = new TemplateInfo(template).AllNonstandardBaseTemplates;
-
-						foreach (var baseTemplate in baseTemplates)
-						{
-							if (!_templateLookup.ContainsKey(baseTemplate.Template.ID.ToString()))
-								_templateLookup.Add(baseTemplate.Template.ID.ToString(), baseTemplate.Template);
-						}
-					}
+					var templates = _templateMetadata.Interfaces.Select(x => x.Template).ToArray();
+					_templateLookup = templates.ToDictionary(x => x.TemplateId.ToString());
+					// note: metadata already contains all base templates that the generator would use
+					// so we can take it at face value
 				}
 
 				return _templateLookup;
